@@ -5,17 +5,15 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from 'ffmpeg-static';
 import axios from 'axios';
 
-// Set the FFmpeg binary path from ffmpeg-static
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-// Disable Next.js body parsing (we handle file uploads manually)
 export const config = {
   api: { bodyParser: false },
 };
 
 /**
  * getTranscript:
- * Uploads a video file to AssemblyAI, starts a transcription job,
+ * Uploads the file at filePath to AssemblyAI, starts a transcription job,
  * and polls until the transcript is complete.
  * Returns the transcript text.
  */
@@ -26,7 +24,6 @@ async function getTranscript(filePath) {
   if (!apiKey) {
     throw new Error('Missing AssemblyAI API key in ASSEMBLYAI_API_KEY environment variable.');
   }
-
   // Upload the file
   const fileStream = fs.createReadStream(filePath);
   const uploadResponse = await axios({
@@ -49,7 +46,7 @@ async function getTranscript(filePath) {
   });
   const transcriptId = transcriptResponse.data.id;
 
-  // Poll the transcription endpoint every 5 seconds
+  // Poll the transcription endpoint every 5 seconds until completed
   let transcriptText = '';
   while (true) {
     await new Promise((res) => setTimeout(res, 5000));
@@ -64,75 +61,48 @@ async function getTranscript(filePath) {
     } else if (pollingResponse.data.status === 'error') {
       throw new Error('Transcript API error: ' + pollingResponse.data.error);
     }
-    // Continue polling...
   }
   return transcriptText;
 }
 
 /**
  * processSegmentWithFFmpeg:
- * Processes a single video segment by:
- *  - Scaling it to vertical resolution (1080x1920)
- *  - Overlaying the provided transcript text using drawtext
- *  - Scaling the gameplay clip (ss.mp4) to 300px in height
- *  - Overlaying the gameplay clip at the bottom (with 20px margin)
+ * Processes a single video segment by scaling it to vertical (1080x1920),
+ * overlaying the transcript text, scaling the gameplay clip, and overlaying it at the bottom.
  */
 function processSegmentWithFFmpeg(inputPath, outputPath, transcript) {
   return new Promise((resolve, reject) => {
+    // Build the filtergraph as a single string.
+    // Note: transcript text is escaped for single quotes.
+    const safeTranscript = transcript.replace(/'/g, "\\'");
+    const fontPath = path.join(process.cwd(), 'fonts', 'Roboto-Regular.ttf');
+    const filterGraph = `[0:v]scale=1080:1920[main_scaled]; ` +
+      `[main_scaled]drawtext=fontfile='${fontPath}':text='${safeTranscript}':fontsize=48:fontcolor=white:x=(w-text_w)/2:y=50[main_text]; ` +
+      `[1:v]scale=trunc(iw*300/ih):300[ss_scaled]; ` +
+      `[main_text][ss_scaled]overlay=0:main_text_h-overlay_h-20[final]`;
+      
     ffmpeg()
-      // Input 0: main video segment
       .input(inputPath)
-      // Input 1: gameplay clip from public folder
       .input(path.join(process.cwd(), 'public', 'ss.mp4'))
-      .complexFilter([
-        // Scale main video to 1080x1920 (vertical)
-        {
-          filter: 'scale',
-          options: '1080:1920',
-          inputs: '[0:v]',
-          outputs: 'main_scaled'
-        },
-        // Overlay transcript text on the main video
-        {
-          filter: 'drawtext',
-          options: {
-            fontfile: path.join(process.cwd(), 'fonts', 'Roboto-Regular.ttf'),
-            text: transcript,
-            fontsize: 48,
-            fontcolor: 'white',
-            x: '(w-text_w)/2',
-            y: '50'
-          },
-          inputs: 'main_scaled',
-          outputs: 'main_text'
-        },
-        // Scale the gameplay clip to a fixed height of 300px while preserving aspect ratio
-        {
-          filter: 'scale',
-          options: 'trunc(iw*300/ih):300',
-          inputs: '[1:v]',
-          outputs: 'ss_scaled'
-        },
-        // Overlay the gameplay clip onto the main video (positioned at the bottom with a 20px margin)
-        {
-          filter: 'overlay',
-          options: { x: 0, y: 'main_text_h - overlay_h - 20' },
-          inputs: ['main_text', 'ss_scaled'],
-          outputs: 'final'
-        }
-      ], 'final')
-      // Copy audio stream without re-encoding
+      .complexFilter(filterGraph, 'final')
       .outputOptions('-c:a copy')
-      .on('end', () => resolve())
-      .on('error', (err) => reject(err))
+      .on('end', () => {
+        console.log(`Finished processing segment: ${outputPath}`);
+        resolve();
+      })
+      .on('error', (err, stdout, stderr) => {
+        console.error('FFmpeg error:', err.message);
+        console.error('FFmpeg stderr:', stderr);
+        reject(err);
+      })
       .save(outputPath);
   });
 }
 
 /**
  * splitVideo:
- * Splits the long video into 1-minute segments using FFmpeg’s segment filter.
- * The segments are saved in the specified directory.
+ * Splits the input video into 1-minute segments using FFmpeg’s segment filter.
+ * The segments are stored in segmentsDir.
  */
 function splitVideo(inputPath, segmentsDir) {
   return new Promise((resolve, reject) => {
@@ -145,8 +115,14 @@ function splitVideo(inputPath, segmentsDir) {
         '-reset_timestamps 1'
       ])
       .output(path.join(segmentsDir, 'segment_%03d.mp4'))
-      .on('end', () => resolve())
-      .on('error', (err) => reject(err))
+      .on('end', () => {
+        console.log('Video splitting complete.');
+        resolve();
+      })
+      .on('error', err => {
+        console.error('Error during video splitting:', err);
+        reject(err);
+      })
       .run();
   });
 }
@@ -155,13 +131,8 @@ function splitVideo(inputPath, segmentsDir) {
  * API Route Handler:
  * 1. Parses the uploaded long video.
  * 2. Splits it into 1-minute segments.
- * 3. For each segment, retrieves the transcript via AssemblyAI,
- *    processes the segment with FFmpeg, and saves the output.
+ * 3. For each segment, retrieves the transcript and processes it with FFmpeg.
  * 4. Returns a JSON list of processed segment filenames.
- *
- * Note: For a 56-minute video, processing all segments sequentially
- * may exceed serverless execution limits. This is a production-ready
- * example, but in production consider processing segments asynchronously.
  */
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -191,18 +162,19 @@ export default async function handler(req, res) {
       
       for (const file of segmentFiles) {
         const segPath = path.join(segmentsDir, file);
+        console.log(`Processing segment: ${file}`);
         const transcript = await getTranscript(segPath);
         const outputSegment = path.join(segmentsDir, `processed_${file}`);
         await processSegmentWithFFmpeg(segPath, outputSegment, transcript);
         processedSegments.push(path.basename(outputSegment));
       }
       
-      // Return a JSON list of processed segment filenames.
       res.status(200).json({ processedSegments });
       
-      // Optionally, clean up the original uploaded file.
+      // Optionally clean up the uploaded file.
       fs.unlinkSync(inputPath);
     } catch (error) {
+      console.error('Processing error:', error);
       res.status(500).json({ error: error.message });
     }
   });
